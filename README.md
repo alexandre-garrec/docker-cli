@@ -2,6 +2,8 @@
 
 This tool allows you to manage your Docker stack and local tasks (scripts from `package.json`, etc.) through a fast and fluid Terminal User Interface (TUI).
 
+<img width="914" height="695" alt="Capture d’écran 2026-02-07 à 23 37 14" src="https://github.com/user-attachments/assets/aece013d-c674-4179-be35-302dda7f36f7" />
+
 ## Features
 
 - **Project Auto-detection**:

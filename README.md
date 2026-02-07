@@ -1,7 +1,5 @@
 # docker-cli (Rust)
 
-A Rust port of the **efora-dev-tui** (Node.js) CLI.
-
 This tool allows you to manage your Docker stack and local tasks (scripts from `package.json`, etc.) through a fast and fluid Terminal User Interface (TUI).
 
 ## Features

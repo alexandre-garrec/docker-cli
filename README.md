@@ -4,12 +4,6 @@ A fast, fluid, and powerful Terminal User Interface (TUI) to manage your Docker 
 
 ![Docker CLI TUI Demo](docs/screenshot-main.png)
 
-<p align="center">
-  <img src="docs/screenshot-explorer.png" alt="Interactive Explorer Popup" width="48%">
-  &nbsp;
-  <img src="docs/screenshot-logs.png" alt="Live Log Filtering" width="48%">
-</p>
-
 ## ✨ Key Features
 
 ### 🏗️ Advanced Architecture Support

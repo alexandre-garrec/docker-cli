@@ -142,11 +142,16 @@ pub fn get_config(profile: &str) -> Config {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(1000);
 
+    let auto_compose_up = cwd.join("docker-compose.yml").exists()
+        || cwd.join("compose.yml").exists()
+        || cwd.join("docker-compose.yaml").exists()
+        || cwd.join("compose.yaml").exists();
+
     Config {
         cwd,
         profile: prof.clone(),
         docker_bin: resolve_docker_binary(),
-        auto_compose_up: true,
+        auto_compose_up,
         compose_profile: prof,
         db_container: std::env::var("DB_CONTAINER").unwrap_or_else(|_| "supabase-db".to_string()),
         storage_container: std::env::var("STORAGE_CONTAINER")

@@ -21,14 +21,13 @@ pub async fn handle_action(app: &mut App, c: char) -> Result<()> {
             match item.kind {
                 SidebarKind::Container if app.docker.available => {
                     if let Ok(v) = docker::container_inspect(&app.docker, &app.cfg.cwd, &item.id).await {
-                        let content = docker::format_container_info(&v);
-                        app.popup = Some(Popup::Inspect { title: format!("Inspect: {}", item.name), content });
+                        app.popup = Some(Popup::Inspect { id: item.id.clone(), name: item.name.clone(), json: v, tab: 0 });
                     }
                 }
                 SidebarKind::SwarmService if app.docker.available => {
                     let out = docker::cmd_inspect_service(&app.docker, &app.cfg.cwd, &item.id).await
                         .unwrap_or_else(|e| format!("Error: {e}"));
-                    app.popup = Some(Popup::Inspect { title: format!("Service: {}", item.name), content: out });
+                    app.popup = Some(Popup::Inspect { id: item.id.clone(), name: item.name.clone(), json: serde_json::from_str(&out).unwrap_or(serde_json::Value::String(out)), tab: 0 });
                 }
                 _ => {}
             }
@@ -185,39 +184,66 @@ pub async fn handle_action(app: &mut App, c: char) -> Result<()> {
         }
         'p' => {
             if app.items.is_empty() { return Ok(()); }
-            let item = app.items[app.selected].clone();
-            if item.kind == SidebarKind::Container && app.docker.available {
-                app.push_current_log(&format!("Pausing container {}...", item.name));
-                if let Err(e) = docker::container_action(&app.docker, &app.cfg.cwd, "pause", &item.id).await {
-                    app.push_current_log(&format!("❌ Pause failed: {e}"));
+            let ids = if !app.multi_selected.is_empty() {
+                app.multi_selected.iter().cloned().collect::<Vec<_>>()
+            } else {
+                vec![app.items[app.selected].id.clone()]
+            };
+            for id in ids {
+                if let Some(item) = app.items.iter().find(|i| i.id == id).cloned() {
+                    if item.kind == SidebarKind::Container && app.docker.available {
+                        app.push_current_log(&format!("Pausing container {}...", item.name));
+                        if let Err(e) = docker::container_action(&app.docker, &app.cfg.cwd, "pause", &item.id).await {
+                            app.push_current_log(&format!("❌ Pause failed: {e}"));
+                        }
+                    }
                 }
-                let _ = app.refresh_containers().await;
-                app.rebuild_items();
             }
+            app.multi_selected.clear();
+            let _ = app.refresh_containers().await;
+            app.rebuild_items();
         }
         'u' => {
             if app.items.is_empty() { return Ok(()); }
-            let item = app.items[app.selected].clone();
-            if item.kind == SidebarKind::Container && app.docker.available {
-                app.push_current_log(&format!("Unpausing container {}...", item.name));
-                if let Err(e) = docker::container_action(&app.docker, &app.cfg.cwd, "unpause", &item.id).await {
-                    app.push_current_log(&format!("❌ Unpause failed: {e}"));
+            let ids = if !app.multi_selected.is_empty() {
+                app.multi_selected.iter().cloned().collect::<Vec<_>>()
+            } else {
+                vec![app.items[app.selected].id.clone()]
+            };
+            for id in ids {
+                if let Some(item) = app.items.iter().find(|i| i.id == id).cloned() {
+                    if item.kind == SidebarKind::Container && app.docker.available {
+                        app.push_current_log(&format!("Unpausing container {}...", item.name));
+                        if let Err(e) = docker::container_action(&app.docker, &app.cfg.cwd, "unpause", &item.id).await {
+                            app.push_current_log(&format!("❌ Unpause failed: {e}"));
+                        }
+                    }
                 }
-                let _ = app.refresh_containers().await;
-                app.rebuild_items();
             }
+            app.multi_selected.clear();
+            let _ = app.refresh_containers().await;
+            app.rebuild_items();
         }
         'k' => {
             if app.items.is_empty() { return Ok(()); }
-            let item = app.items[app.selected].clone();
-            if item.kind == SidebarKind::Container && app.docker.available {
-                app.push_current_log(&format!("Killing container {}...", item.name));
-                if let Err(e) = docker::container_action(&app.docker, &app.cfg.cwd, "kill", &item.id).await {
-                    app.push_current_log(&format!("❌ Kill failed: {e}"));
+            let ids = if !app.multi_selected.is_empty() {
+                app.multi_selected.iter().cloned().collect::<Vec<_>>()
+            } else {
+                vec![app.items[app.selected].id.clone()]
+            };
+            for id in ids {
+                if let Some(item) = app.items.iter().find(|i| i.id == id).cloned() {
+                    if item.kind == SidebarKind::Container && app.docker.available {
+                        app.push_current_log(&format!("Killing container {}...", item.name));
+                        if let Err(e) = docker::container_action(&app.docker, &app.cfg.cwd, "kill", &item.id).await {
+                            app.push_current_log(&format!("❌ Kill failed: {e}"));
+                        }
+                    }
                 }
-                let _ = app.refresh_containers().await;
-                app.rebuild_items();
             }
+            app.multi_selected.clear();
+            let _ = app.refresh_containers().await;
+            app.rebuild_items();
         }
         'd' => {
             if app.items.is_empty() { return Ok(()); }
@@ -299,6 +325,21 @@ pub async fn handle_action(app: &mut App, c: char) -> Result<()> {
                         app.push_current_log("✅ Compose restart done.");
                     }
                     Err(e) => app.push_current_log(&format!("❌ Restart failed: {e}")),
+                }
+            }
+        }
+        'D' => {
+            if app.items.is_empty() { return Ok(()); }
+            let item = app.items[app.selected].clone();
+            if item.kind == SidebarKind::GroupHeader && item.id != "__pins__" && !item.id.starts_with("stack:") && app.docker.available {
+                let project = item.id.clone();
+                app.push_current_log(&format!("🛑 Stopping compose project {}...", project));
+                match docker::compose_group_down(&app.docker, &app.cfg.cwd, &project).await {
+                    Ok(lines) => {
+                        for l in lines { app.push_current_log(&l); }
+                        app.push_current_log("✅ Compose down done.");
+                    }
+                    Err(e) => app.push_current_log(&format!("❌ Down failed: {e}")),
                 }
             }
         }

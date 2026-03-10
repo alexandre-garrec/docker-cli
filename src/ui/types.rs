@@ -11,7 +11,6 @@ pub enum SidebarKind {
     GroupHeader,
     Container,
     SwarmService,
-    Image,
     Separator,
 }
 
@@ -36,8 +35,9 @@ pub struct TaskRuntime {
 
 #[derive(Clone)]
 pub enum Popup {
-    Inspect { title: String, content: String },
+    Inspect { id: String, name: String, json: serde_json::Value, tab: usize },
     ConfirmReset { id: String, name: String },
+    ConfirmBulkRemove { ids: Vec<String> },
     ConfirmComposeRestart { infra_running: bool },
     ScaleService { id: String, name: String, current: u64, input: String },
     Volumes { volumes: Vec<crate::docker::DockerVolume>, selected: usize },
@@ -45,6 +45,7 @@ pub enum Popup {
     ContextSwitch { contexts: Vec<crate::docker::DockerContext>, selected: usize },
     SystemHealth { data: Vec<docker::SystemDfRow> },
     ImageExplorer { images: Vec<crate::docker::DockerImage>, selected: usize },
+    FileExplorer { id: String, name: String, path: String, files: Vec<(String, bool)>, selected: usize },
     ConfirmPrune,
     Help,
 }

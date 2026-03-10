@@ -4,8 +4,49 @@ use crate::docker;
 use crossterm::event::{KeyCode, KeyModifiers, EnableMouseCapture, DisableMouseCapture};
 use tokio::io::AsyncWriteExt;
 use std::io;
-
 pub async fn handle_shortcut(app: &mut App, k: KeyCode, modifiers: KeyModifiers) -> bool {
+    // ── Integrated Shell Mode ──
+    if app.shell_active {
+        if k == KeyCode::Esc {
+            app.stop_shell().await;
+        } else {
+            let data_to_send = match k {
+                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => Some("\x03".to_string()),
+                KeyCode::Char(c) => Some(c.to_string()),
+                KeyCode::Enter => Some("\r".to_string()),
+                KeyCode::Backspace => Some("\x7f".to_string()),
+                KeyCode::Tab => Some("\t".to_string()),
+                KeyCode::Up => Some("\x1b[A".to_string()),
+                KeyCode::Down => Some("\x1b[B".to_string()),
+                KeyCode::Right => Some("\x1b[C".to_string()),
+                KeyCode::Left => Some("\x1b[D".to_string()),
+                _ => None,
+            };
+
+            // Update visual input buffer
+            match k {
+                KeyCode::Char(c) => { app.shell_input.push(c); }
+                KeyCode::Backspace => { app.shell_input.pop(); }
+                KeyCode::Enter => { app.shell_input.clear(); }
+                _ => {}
+            }
+
+            if let Some(data) = data_to_send {
+                let mut res = Ok(());
+                if let Some(stdin) = app.shell_stdin.as_mut() {
+                    res = stdin.write_all(data.as_bytes()).await;
+                    if res.is_ok() {
+                        let _ = stdin.flush().await;
+                    }
+                }
+                if let Err(e) = res {
+                    app.push_current_log(&format!("❌ Shell stdin error: {e}"));
+                }
+            }
+        }
+        return false;
+    }
+
     // Global quit
     if (k == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL))
         || k == KeyCode::Char('q')
@@ -77,41 +118,6 @@ pub async fn handle_shortcut(app: &mut App, k: KeyCode, modifiers: KeyModifiers)
         return false;
     }
 
-    // ── Integrated Shell Mode ──
-    if app.shell_active {
-        if k == KeyCode::Esc {
-            app.stop_shell().await;
-        } else {
-            let mut data_to_send = None;
-            
-            match k {
-                KeyCode::Char(c) => {
-                    app.shell_input.push(c);
-                }
-                KeyCode::Enter => {
-                    let cmd = app.shell_input.clone();
-                    app.push_partial_log(&format!("❯ {}\n", cmd));
-                    data_to_send = Some(cmd + "\n");
-                    app.shell_input.clear();
-                }
-                KeyCode::Backspace => {
-                    app.shell_input.pop();
-                }
-                KeyCode::Tab => {
-                    app.shell_input.push('\t');
-                }
-                _ => {}
-            }
-
-            if let Some(data) = data_to_send {
-                if let Some(stdin) = app.shell_stdin.as_mut() {
-                    let _ = stdin.write_all(data.as_bytes()).await;
-                    let _ = stdin.flush().await;
-                }
-            }
-        }
-        return false;
-    }
 
     // ── Copy mode ──
     if app.copy_mode {
@@ -123,9 +129,18 @@ pub async fn handle_shortcut(app: &mut App, k: KeyCode, modifiers: KeyModifiers)
     // popup mode
     if let Some(p) = app.popup.clone() {
         match p {
-            Popup::Inspect { .. } | Popup::Help => {
-                if matches!(k, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?')) {
-                    app.popup = None;
+            Popup::Inspect { id, name, json, tab } => {
+                match k {
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
+                        app.popup = None;
+                    }
+                    KeyCode::Tab | KeyCode::Right => {
+                        app.popup = Some(Popup::Inspect { id, name, json, tab: (tab + 1) % 3 });
+                    }
+                    KeyCode::Left => {
+                        app.popup = Some(Popup::Inspect { id, name, json, tab: (tab + 2) % 3 });
+                    }
+                    _ => {}
                 }
                 return false;
             }
@@ -141,12 +156,75 @@ pub async fn handle_shortcut(app: &mut App, k: KeyCode, modifiers: KeyModifiers)
                 }
                 return false;
             }
+            Popup::ConfirmBulkRemove { ids } => {
+                match k {
+                    KeyCode::Char('y') | KeyCode::Enter => {
+                        app.popup = None;
+                        app.push_current_log(&format!("🗑️ Removing {} containers...", ids.len()));
+                        for id in ids {
+                            let _ = crate::docker::container_rm_force(&app.docker, &app.cfg.cwd, &id).await;
+                        }
+                        let _ = app.refresh_containers().await;
+                        app.rebuild_items();
+                    }
+                    KeyCode::Esc | KeyCode::Char('n') => {
+                        app.popup = None;
+                    }
+                    _ => {}
+                }
+                return false;
+            }
             Popup::ConfirmPrune => {
                 match k {
                     KeyCode::Char('y') | KeyCode::Enter => {
+                        app.popup = None;
+                        app.push_current_log("🧹 Pruning system...");
+                        app.stats_refreshing = true;
                         let _ = app.trigger_prune().await;
                     }
                     KeyCode::Esc | KeyCode::Char('n') => {
+                        app.popup = None;
+                    }
+                    _ => {}
+                }
+                return false;
+            }
+            Popup::Help => {
+                if matches!(k, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?')) {
+                    app.popup = None;
+                }
+                return false;
+            }
+            Popup::FileExplorer { id, name, path, files, selected } => {
+                match k {
+                    KeyCode::Up => {
+                        let new_sel = if selected == 0 { files.len().saturating_sub(1) } else { selected - 1 };
+                        app.popup = Some(Popup::FileExplorer { id, name, path, files, selected: new_sel });
+                    }
+                    KeyCode::Down => {
+                        let new_sel = if files.is_empty() { 0 } else { (selected + 1) % files.len() };
+                        app.popup = Some(Popup::FileExplorer { id, name, path, files, selected: new_sel });
+                    }
+                    KeyCode::Enter | KeyCode::Right => {
+                        if let Some((fname, is_dir)) = files.get(selected) {
+                            if *is_dir {
+                                let new_path = if path == "/" { format!("/{}", fname) } else { format!("{}/{}", path, fname) };
+                                if let Ok(new_files) = docker::list_container_files(&app.docker, &id, &new_path).await {
+                                    app.popup = Some(Popup::FileExplorer { id, name, path: new_path, files: new_files, selected: 0 });
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Backspace | KeyCode::Left => {
+                        if path != "/" {
+                            let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+                            let new_path = if parts.len() <= 1 { "/".to_string() } else { format!("/{}", parts[..parts.len()-1].join("/")) };
+                            if let Ok(new_files) = docker::list_container_files(&app.docker, &id, &new_path).await {
+                                app.popup = Some(Popup::FileExplorer { id, name, path: new_path, files: new_files, selected: 0 });
+                            }
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
                         app.popup = None;
                     }
                     _ => {}
@@ -409,12 +487,79 @@ pub async fn handle_shortcut(app: &mut App, k: KeyCode, modifiers: KeyModifiers)
         return false;
     }
 
-    // C: switch context
+    // s: Toggle sort cycle (Name -> Status -> Id)
+    if k == KeyCode::Char('s') && app.popup.is_none() && !app.is_filtering {
+        let next = match app.sort_by {
+            crate::ui::app::SortBy::Name => crate::ui::app::SortBy::Status,
+            crate::ui::app::SortBy::Status => crate::ui::app::SortBy::Id,
+            crate::ui::app::SortBy::Id => crate::ui::app::SortBy::Name,
+            _ => crate::ui::app::SortBy::Name,
+        };
+        app.toggle_sort(next);
+        app.rebuild_items();
+        let order = if app.sort_order == crate::ui::app::SortOrder::Asc { "↑" } else { "↓" };
+        app.notify(format!("🔃 Sort: {:?} {}", app.sort_by, order), ratatui::style::Color::Blue);
+        return false;
+    }
+
+    // p: Sort by Project
+    if k == KeyCode::Char('p') && app.popup.is_none() && !app.is_filtering {
+        app.toggle_sort(crate::ui::app::SortBy::Project);
+        app.rebuild_items();
+        let order = if app.sort_order == crate::ui::app::SortOrder::Asc { "↑" } else { "↓" };
+        app.notify(format!("📂 Sort: Project {}", order), ratatui::style::Color::Blue);
+        return false;
+    }
+
+    // Context Switch
     if k == KeyCode::Char('C') && app.popup.is_none() && !app.is_filtering {
         let contexts = docker::list_contexts(&app.docker, &app.cfg.cwd).await;
         let current_idx = contexts.iter().position(|c| c.current).unwrap_or(0);
         app.popup = Some(Popup::ContextSwitch { contexts, selected: current_idx });
         return false;
+    }
+
+    // Bulk Actions (Shift+S, Shift+X, Shift+D)
+    if app.popup.is_none() && !app.is_filtering && !app.multi_selected.is_empty() {
+        match k {
+            KeyCode::Char('S') => {
+                let ids: Vec<String> = app.multi_selected.iter().cloned().collect();
+                app.notify(format!("🚀 Bulk Start: {} items", ids.len()), ratatui::style::Color::Cyan);
+                for id in ids {
+                    let _ = docker::container_action(&app.docker, &app.cfg.cwd, "start", &id).await;
+                }
+                let _ = app.refresh_containers().await;
+                app.rebuild_items();
+                return false;
+            }
+            KeyCode::Char('X') => {
+                let ids: Vec<String> = app.multi_selected.iter().cloned().collect();
+                app.notify(format!("🛑 Bulk Stop: {} items", ids.len()), ratatui::style::Color::Yellow);
+                for id in ids {
+                    let _ = docker::container_action(&app.docker, &app.cfg.cwd, "stop", &id).await;
+                }
+                let _ = app.refresh_containers().await;
+                app.rebuild_items();
+                return false;
+            }
+            KeyCode::Char('D') => {
+                app.popup = Some(Popup::ConfirmBulkRemove { ids: app.multi_selected.iter().cloned().collect() });
+                return false;
+            }
+            _ => {}
+        }
+    }
+
+    // Shift+F: Container File Explorer
+    if k == KeyCode::Char('F') && app.focus_on_list && app.popup.is_none() {
+        if let Some(it) = app.items.get(app.selected) {
+            if it.kind == SidebarKind::Container {
+                if let Ok(files) = docker::list_container_files(&app.docker, &it.id, "/").await {
+                    app.popup = Some(Popup::FileExplorer { id: it.id.clone(), name: it.name.clone(), path: "/".to_string(), files, selected: 0 });
+                }
+                return false;
+            }
+        }
     }
 
     // focus toggle
@@ -478,6 +623,15 @@ pub async fn handle_shortcut(app: &mut App, k: KeyCode, modifiers: KeyModifiers)
                 return false;
             }
         }
+    }
+
+    // E: Export logs
+    if k == KeyCode::Char('E') && app.popup.is_none() && !app.is_filtering {
+        match app.export_logs().await {
+            Ok(file) => app.notify(format!("📂 Logs exported to {file}"), ratatui::style::Color::Cyan),
+            Err(e) => app.notify(format!("❌ Export failed: {e}"), ratatui::style::Color::Red),
+        }
+        return false;
     }
 
     false

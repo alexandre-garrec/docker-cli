@@ -22,37 +22,34 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(color_secondary).add_modifier(Modifier::BOLD)
         )
     } else {
-        let stats_info = app.container_stats.as_ref().map(|s| {
-            let cpu_gauge = crate::docker::ContainerStats::gauge_char(s.cpu_percent);
-            let mem_gauge = crate::docker::ContainerStats::gauge_char(s.mem_percent);
-            
-            let mem = if s.mem_usage_mb >= 1024.0 {
-                format!("{:.1}G/{:.1}G", s.mem_usage_mb / 1024.0, s.mem_limit_mb / 1024.0)
-            } else {
-                format!("{:.0}M/{:.0}M", s.mem_usage_mb, s.mem_limit_mb)
-            };
-            let net = format!("↓{:.1}M ↑{:.1}M", s.net_rx_mb, s.net_tx_mb);
-            let block = format!("R{:.1}M W{:.1}M", s.block_read_mb, s.block_write_mb);
-            format!("  CPU {} {:.1}%  RAM {} {}  NET {}  IO {}", cpu_gauge, s.cpu_percent, mem_gauge, mem, net, block)
-        }).unwrap_or_default();
-        
         let follow_status = if app.follow_mode { "[FOLLOWING]" } else { "[PAUSED]" };
         let t = if app.current_target.is_empty() {
             format!(" 📑 Logs {} ", follow_status)
         } else {
-            format!(" 📑 Logs {} — {t}{stats} ", follow_status, t = app.current_target, stats = stats_info)
+            let stats_text = if let Some(s) = &app.container_stats {
+                format!("  NET: ↓{:.1}M ↑{:.1}M  IO: R{:.1}M W{:.1}M", s.net_rx_mb, s.net_tx_mb, s.block_read_mb, s.block_write_mb)
+            } else {
+                String::new()
+            };
+            format!(" 📑 Logs {} — {t}{stats_text} ", follow_status, t = app.current_target, stats_text = stats_text)
         };
         (t, border_style_logs)
     };
 
-    let (right_pane_history, right_pane_input) = if app.shell_active {
+    let (stats_area, right_pane_history, right_pane_input) = if app.shell_active {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(0), Constraint::Length(3)].as_ref())
             .split(area);
-        (chunks[0], Some(chunks[1]))
+        (None, chunks[0], Some(chunks[1]))
+    } else if app.container_stats.is_some() {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
+            .split(area);
+        (Some(chunks[0]), chunks[1], None)
     } else {
-        (area, None)
+        (None, area, None)
     };
 
     let query_lower = app.log_filter_query.to_lowercase();
@@ -68,6 +65,16 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
     let log_text_lines: Vec<Line> = filtered_lines
         .into_iter()
         .map(|l| {
+            let mut base_style = Style::default().fg(Color::White);
+            let lower_l = l.to_lowercase();
+            if lower_l.contains("error") || lower_l.contains("fail") || lower_l.starts_with("[err]") || lower_l.contains("exception") {
+                base_style = base_style.fg(Color::Red);
+            } else if lower_l.contains("warn") {
+                base_style = base_style.fg(Color::Yellow);
+            } else if lower_l.contains("success") || lower_l.starts_with("[out]") || lower_l.contains("done") || lower_l.contains("=> ok") {
+                base_style = base_style.fg(Color::Green);
+            }
+
             if l.starts_with('❯') {
                 Line::from(vec![
                     Span::styled(" ❯ ", Style::default().fg(color_secondary).add_modifier(Modifier::BOLD)),
@@ -76,11 +83,10 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
             } else if is_active_filter {
                 // Highlight matches
                 let mut spans = Vec::new();
-                let lower_l = l.to_lowercase();
                 let mut last_idx = 0;
                 for (idx, _) in lower_l.match_indices(&query_lower) {
                     if idx > last_idx {
-                        spans.push(Span::raw(l[last_idx..idx].to_string()));
+                        spans.push(Span::styled(l[last_idx..idx].to_string(), base_style));
                     }
                     spans.push(Span::styled(
                         l[idx..idx + query_lower.len()].to_string(),
@@ -89,11 +95,11 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
                     last_idx = idx + query_lower.len();
                 }
                 if last_idx < l.len() {
-                    spans.push(Span::raw(l[last_idx..].to_string()));
+                    spans.push(Span::styled(l[last_idx..].to_string(), base_style));
                 }
                 Line::from(spans)
             } else {
-                Line::from(Span::raw(l))
+                Line::from(Span::styled(l, base_style))
             }
         })
         .collect();
@@ -118,6 +124,26 @@ pub fn draw_logs(f: &mut Frame, app: &mut App, area: Rect) {
         .wrap(Wrap { trim: false })
         .scroll((app.log_scroll, 0));
     f.render_widget(logs, right_pane_history);
+
+    if let (Some(stats_area), Some(stats)) = (stats_area, &app.container_stats) {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+            .split(stats_area);
+
+        let cpu_gauge = ratatui::widgets::Gauge::default()
+            .block(Block::default().borders(Borders::ALL).title(" CPU Usage "))
+            .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
+            .percent(stats.cpu_percent.min(100.0) as u16);
+        
+        let mem_gauge = ratatui::widgets::Gauge::default()
+            .block(Block::default().borders(Borders::ALL).title(format!(" Memory: {:.1}MB / {:.1}MB ", stats.mem_usage_mb, stats.mem_limit_mb)))
+            .gauge_style(Style::default().fg(Color::Magenta).bg(Color::DarkGray))
+            .percent(stats.mem_percent.min(100.0) as u16);
+
+        f.render_widget(cpu_gauge, chunks[0]);
+        f.render_widget(mem_gauge, chunks[1]);
+    }
 
     if let Some(input_area) = right_pane_input {
         let input_text = Line::from(vec![

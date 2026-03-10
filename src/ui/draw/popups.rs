@@ -1,27 +1,59 @@
 use crate::ui::app::App;
 use crate::ui::types::Popup;
-use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap, Table, Row, Cell};
 use ratatui::Frame;
 
 use super::utils::centered_rect;
 
-pub fn draw_popup(f: &mut Frame, app: &App, p: &Popup) {
+pub fn draw_popup(f: &mut Frame, _app: &App, p: &Popup) {
     match p {
-        Popup::Inspect { title, content } => {
-            let area = centered_rect(80, 80, f.area());
+        Popup::Inspect { name, json, tab, .. } => {
+            let area = centered_rect(90, 90, f.area());
             f.render_widget(Clear, area);
-            let text: Text = content
-                .lines()
-                .map(|l| Line::from(Span::raw(l.to_string())))
-                .collect::<Vec<_>>()
-                .into();
-            let w = Paragraph::new(text)
-                .block(Block::default().borders(Borders::ALL).title(title.clone()))
+            
+            let tabs = [" [1] Summary ", " [2] Config ", " [3] Network "];
+            let tab_spans: Vec<Span> = tabs.iter().enumerate().map(|(i, &t)| {
+                if i == *tab {
+                    Span::styled(t, Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
+                } else {
+                    Span::raw(t)
+                }
+            }).collect();
+            let tab_line = Line::from(tab_spans);
+
+            let content = match tab {
+                0 => {
+                    let id = json["Id"].as_str().unwrap_or("-");
+                    let created = json["Created"].as_str().unwrap_or("-");
+                    let path = json["Path"].as_str().unwrap_or("-");
+                    let args = json["Args"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+                    format!("ID: {id}\nName: {name}\nCreated: {created}\nPath: {path} {args}\n\n[Tab/Arrows] Switch tabs, [Esc] Close")
+                }
+                1 => {
+                    let image = json["Config"]["Image"].as_str().unwrap_or("-");
+                    let env = json["Config"]["Env"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+                    let labels = json["Config"]["Labels"].as_object().map(|o| o.iter().map(|(k,v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+                    format!("Image: {image}\n\n-- ENV --\n{env}\n\n-- Labels --\n{labels}")
+                }
+                2 => {
+                    let nw = json["NetworkSettings"]["Networks"].as_object().map(|o| {
+                        o.iter().map(|(k,v)| format!("{k}:\n  IP: {}\n  Gateway: {}", v["IPAddress"], v["Gateway"])).collect::<Vec<_>>().join("\n")
+                    }).unwrap_or_else(|| "No network info".to_string());
+                    format!("-- Networks --\n{nw}")
+                }
+                _ => "Unknown tab".to_string(),
+            };
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(tab_line);
+            
+            let p = Paragraph::new(content)
+                .block(block)
                 .wrap(Wrap { trim: false });
-            f.render_widget(w, area);
+            f.render_widget(p, area);
         }
         Popup::ConfirmReset { name, .. } => {
             let area = centered_rect(60, 25, f.area());
@@ -31,6 +63,18 @@ pub fn draw_popup(f: &mut Frame, app: &App, p: &Popup) {
             );
             let w = Paragraph::new(msg)
                 .block(Block::default().borders(Borders::ALL).title(" ⚠️  RESET CONTAINER "))
+                .wrap(Wrap { trim: false });
+            f.render_widget(w, area);
+        }
+        Popup::ConfirmBulkRemove { ids } => {
+            let area = centered_rect(60, 25, f.area());
+            f.render_widget(Clear, area);
+            let msg = format!(
+                "REMOVE {} containers?\nThis will STOP and DELETE the selected containers.\n\n[y/Enter]=Remove, [n/Esc]=Cancel",
+                ids.len()
+            );
+            let w = Paragraph::new(msg)
+                .block(Block::default().borders(Borders::ALL).title(" ⚠️  BULK REMOVE "))
                 .wrap(Wrap { trim: false });
             f.render_widget(w, area);
         }
@@ -174,43 +218,57 @@ pub fn draw_popup(f: &mut Frame, app: &App, p: &Popup) {
             f.render_widget(w, area);
         }
         Popup::SystemHealth { data } => {
-            let area = centered_rect(65, 55, f.area());
+            let area = centered_rect(65, 75, f.area());
             f.render_widget(Clear, area);
             let title = " 📊 Global System Health (Disk Usage) ";
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled("  TYPE", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw("            "),
-                    Span::styled("TOTAL", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw("    "),
-                    Span::styled("ACTIVE", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw("    "),
-                    Span::styled("SIZE", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw("    "),
-                    Span::styled("RECLAIMABLE", Style::default().add_modifier(Modifier::BOLD)),
-                ]),
-                Line::from("  ".to_string() + &"─".repeat(area.width.saturating_sub(6) as usize)),
-            ];
+            
+            let chunks = ratatui::layout::Layout::default()
+                .direction(ratatui::layout::Direction::Vertical)
+                .constraints([
+                    ratatui::layout::Constraint::Length(data.len() as u16 * 4 + 2),
+                    ratatui::layout::Constraint::Min(0),
+                    ratatui::layout::Constraint::Length(2),
+                ])
+                .margin(1)
+                .split(area);
+
+            f.render_widget(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)).title(title), area);
+
+            let mut current_y = chunks[0].y;
             for row in data {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {:<15}", row.kind), Style::default().fg(Color::Rgb(255, 170, 0))),
-                    Span::raw(format!("{:<10}", row.total)),
-                    Span::raw(format!("{:<10}", row.active)),
-                    Span::raw(format!("{:<10}", row.size)),
-                    Span::styled(format!("{:<15}", row.reclaimable), Style::default().fg(Color::Green)),
-                ]));
+                let row_area = ratatui::layout::Rect {
+                    x: chunks[0].x + 1,
+                    y: current_y,
+                    width: chunks[0].width - 2,
+                    height: 3,
+                };
+                current_y += 4;
+
+                let row_chunks = ratatui::layout::Layout::default()
+                    .direction(ratatui::layout::Direction::Vertical)
+                    .constraints([
+                        ratatui::layout::Constraint::Length(1),
+                        ratatui::layout::Constraint::Length(1),
+                        ratatui::layout::Constraint::Length(1),
+                    ])
+                    .split(row_area);
+
+                f.render_widget(Paragraph::new(Line::from(vec![
+                    Span::styled(format!("  {:<12}", row.kind), Style::default().fg(Color::Rgb(255, 170, 0)).add_modifier(Modifier::BOLD)),
+                    Span::raw(format!(" Total: {}  Active: {}  Size: {}", row.total, row.active, row.size)),
+                ])), row_chunks[0]);
+
+                let gauge = ratatui::widgets::Gauge::default()
+                    .block(Block::default())
+                    .gauge_style(Style::default().fg(Color::Green).bg(Color::Rgb(40, 40, 40)))
+                    .percent(row.reclaimable_percent as u16)
+                    .label(format!("Reclaimable: {} ({:.1}%)", row.reclaimable, row.reclaimable_percent));
+                f.render_widget(gauge, row_chunks[1]);
             }
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::raw("   [X] "),
-                Span::styled("Run System Prune (Cleanup)", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::raw("   [Esc] "),
-                Span::styled("Close", Style::default().fg(Color::White)),
-            ]));
-            let w = Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)).title(title))
-                .wrap(Wrap { trim: false });
-            f.render_widget(w, area);
+
+            let help_text = Paragraph::new("   [X]:System Prune (Cleanup)   [Esc]:Close ")
+                .style(Style::default().fg(Color::Gray));
+            f.render_widget(help_text, chunks[2]);
         }
         Popup::ImageExplorer { images, selected } => {
             let area = centered_rect(80, 70, f.area());
@@ -261,6 +319,41 @@ pub fn draw_popup(f: &mut Frame, app: &App, p: &Popup) {
                 height: 1,
             };
             let help_text = Paragraph::new(" ↑/↓:Nav  d:Rm  D:ForceRm  Esc/Enter:Close ").style(Style::default().fg(Color::Gray));
+            f.render_widget(help_text, help_area);
+        }
+        Popup::FileExplorer { name, path, files, selected, .. } => {
+            let area = centered_rect(80, 80, f.area());
+            f.render_widget(Clear, area);
+            let title = format!(" 📂 Explorer: {name} [{path}] ");
+
+            let rows = files.iter().enumerate().map(|(i, (fname, is_dir))| {
+                let style = if i == *selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let icon = if *is_dir { "📁" } else { "📄" };
+                Row::new(vec![Cell::from(icon), Cell::from(fname.clone())]).style(style)
+            });
+
+            let t = Table::new(
+                rows,
+                [
+                    ratatui::layout::Constraint::Length(4),
+                    ratatui::layout::Constraint::Min(40),
+                ],
+            )
+            .block(Block::default().borders(Borders::ALL).title(title));
+
+            f.render_widget(t, area);
+
+            let help_area = ratatui::layout::Rect {
+                x: area.x,
+                y: area.y + area.height,
+                width: area.width,
+                height: 1,
+            };
+            let help_text = Paragraph::new(" ↑/↓:Nav  Enter/→:Open/Enter  Backspace/←:Back  Esc:Close ").style(Style::default().fg(Color::Gray));
             f.render_widget(help_text, help_area);
         }
         Popup::ConfirmPrune => {

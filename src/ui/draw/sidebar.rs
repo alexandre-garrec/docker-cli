@@ -34,7 +34,6 @@ pub fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
                     let prefix = if it.selected { "● " } else { "○ " };
                     (format!("{prefix}{}", it.label), Style::default())
                 }
-                SidebarKind::Image => (String::new(), Style::default()),
             };
             
             let label = if it.depth > 0 {

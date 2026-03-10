@@ -6,11 +6,24 @@ use crate::ui::types::{SidebarKind, UiItem, TaskRuntime, Popup};
 use anyhow::{Result};
 use ratatui::layout::{Rect};
 use std::collections::{HashMap, HashSet, VecDeque};
-use tokio::process::{Child, ChildStdin};
 use tokio::sync::mpsc;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, PartialEq, Clone)]
+pub enum SortBy {
+    Name,
+    Status,
+    Id,
+    Project,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum SortOrder {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug)]
 pub struct RunOpts {
     pub root: PathBuf,
     #[allow(dead_code)]
@@ -33,7 +46,7 @@ pub struct App {
     pub follow_mode: bool,
     pub last_log_height: u16,
 
-    pub docker_log_child: Option<Child>,
+    pub docker_log_child: Option<crate::docker::LogStream>,
     pub docker_log_rx: Option<mpsc::UnboundedReceiver<String>>,
 
     pub tasks: HashMap<String, TaskRuntime>,
@@ -51,13 +64,17 @@ pub struct App {
     pub copy_mode: bool,
 
     pub container_stats: Option<docker::ContainerStats>,
+    pub stats_history: HashMap<String, VecDeque<(f64, f64)>>,
     pub stats_refreshing: bool,
     pub pins: HashSet<String>,
 
-    pub shell_stdin: Option<ChildStdin>,
-    pub shell_process: Option<Child>,
+    pub shell_stdin: Option<std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>>,
+    pub shell_process: Option<crate::docker::LogStream>,
     pub shell_active: bool,
     pub shell_input: String,
+    
+    pub sort_by: SortBy,
+    pub sort_order: SortOrder,
 
     pub filter_query: String,
     pub is_filtering: bool,
@@ -126,6 +143,7 @@ impl App {
             popup: None,
             copy_mode: false,
             container_stats: None,
+            stats_history: HashMap::new(),
             stats_refreshing: false,
             pins: pins::load_pins(),
             shell_stdin: None,
@@ -138,6 +156,8 @@ impl App {
             is_filtering_logs: false,
             multi_selected: HashSet::new(),
             toast: None,
+            sort_by: SortBy::Name,
+            sort_order: SortOrder::Asc,
         }
     }
 
@@ -164,11 +184,71 @@ impl App {
         Ok(())
     }
 
+    fn get_sparkline(&self, data: impl Iterator<Item = f64>, max: f64, len: usize) -> String {
+        let chars = [" ", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+        let vals: Vec<f64> = data.collect();
+        let mut out = String::new();
+        let start = vals.len().saturating_sub(len);
+        for &v in &vals[start..] {
+            let idx = ((v / max) * (chars.len() - 1) as f64).round() as usize;
+            out.push_str(chars[idx.min(chars.len() - 1)]);
+        }
+        if out.chars().count() < len {
+            format!("{}{}", " ".repeat(len - out.chars().count()), out)
+        } else {
+            out
+        }
+    }
+
     pub fn rebuild_items(&mut self) {
+        let mut sorted_containers = self.containers.clone();
+        let mut sorted_swarm = self.swarm_services.clone();
+
+        match self.sort_by {
+            SortBy::Name => {
+                sorted_containers.sort_by(|a, b| {
+                    let res = docker::container_name(&a.0.names).cmp(&docker::container_name(&b.0.names));
+                    if self.sort_order == SortOrder::Asc { res } else { res.reverse() }
+                });
+                sorted_swarm.sort_by(|a, b| {
+                    let res = a.name.cmp(&b.name);
+                    if self.sort_order == SortOrder::Asc { res } else { res.reverse() }
+                });
+            }
+            SortBy::Status => {
+                sorted_containers.sort_by(|a, b| {
+                    let res = a.0.state.cmp(&b.0.state);
+                    if self.sort_order == SortOrder::Asc { res } else { res.reverse() }
+                });
+            }
+            SortBy::Id => {
+                sorted_containers.sort_by(|a, b| {
+                    let res = a.0.id.cmp(&b.0.id);
+                    if self.sort_order == SortOrder::Asc { res } else { res.reverse() }
+                });
+                sorted_swarm.sort_by(|a, b| {
+                    let res = a.id.cmp(&b.id);
+                    if self.sort_order == SortOrder::Asc { res } else { res.reverse() }
+                });
+            }
+            SortBy::Project => {
+                sorted_containers.sort_by(|a, b| {
+                    let p_a = a.0.compose_project.as_deref().unwrap_or_default();
+                    let p_b = b.0.compose_project.as_deref().unwrap_or_default();
+                    let res = p_a.cmp(p_b);
+                    if self.sort_order == SortOrder::Asc { res } else { res.reverse() }
+                });
+            }
+        }
+
         let mut items: Vec<UiItem> = Vec::new();
         let query = self.filter_query.to_lowercase();
 
         if !query.is_empty() {
+            let re = regex::RegexBuilder::new(&query)
+                .case_insensitive(true)
+                .build().ok();
+
             items.push(UiItem {
                 kind: SidebarKind::Separator,
                 id: "__filter_results__".to_string(),
@@ -180,20 +260,33 @@ impl App {
             });
 
             // Match containers
-            for (c, ports) in &self.containers {
+            for (c, ports) in &sorted_containers {
                 let name = docker::container_name(&c.names);
-                if name.to_lowercase().contains(&query) || c.id.contains(&query) {
+                let is_match = if let Some(ref r) = re {
+                    r.is_match(&name) || r.is_match(&c.id)
+                } else {
+                    name.to_lowercase().contains(&query) || c.id.contains(&query)
+                };
+
+                if is_match {
                     let state = c.state.to_lowercase();
                     let badge = if state == "running" { "🟢" }
                         else if state == "paused" { "🟡" }
                         else if state == "restarting" { "🔵" }
                         else if state == "exited" || state == "dead" { "🔴" }
                         else { "⚪️" };
+                    
+                    let mut label = format!(" {badge} {name}");
+                    if let Some(history) = self.stats_history.get(&c.id) {
+                        let cpu_spark = self.get_sparkline(history.iter().map(|h| h.0), 100.0, 5);
+                        label.push_str(&format!("  [C:{}]", cpu_spark));
+                    }
+
                     items.push(UiItem {
                         kind: SidebarKind::Container,
                         id: c.id.clone(),
                         name: name.clone(),
-                        label: format!(" {badge} {name}"),
+                        label,
                         ports: ports.clone(),
                         selected: self.multi_selected.contains(&c.id),
                         depth: 0,
@@ -201,14 +294,20 @@ impl App {
                 }
             }
             // Match services
-            for svc in &self.swarm_services {
-                if svc.name.to_lowercase().contains(&query) {
+            for svc in &sorted_swarm {
+                let is_match = if let Some(ref r) = re {
+                    r.is_match(&svc.name) || r.is_match(&svc.id)
+                } else {
+                    svc.name.to_lowercase().contains(&query) || svc.id.to_lowercase().contains(&query)
+                };
+
+                if is_match {
                     items.push(UiItem {
                         kind: SidebarKind::SwarmService,
                         id: svc.id.clone(),
                         name: svc.name.clone(),
                         label: format!(" 🐳 {}", svc.name),
-                        ports: vec![],
+                        ports: svc.ports.clone(),
                         selected: self.multi_selected.contains(&svc.id),
                         depth: 0,
                     });
@@ -223,7 +322,7 @@ impl App {
         }
 
         // -- Pinned containers --
-        let pinned: Vec<&(docker::ContainerSummary, Vec<docker::Port>)> = self.containers
+        let pinned: Vec<&(docker::ContainerSummary, Vec<docker::Port>)> = sorted_containers
             .iter()
             .filter(|(c, _)| self.pins.contains(&docker::container_name(&c.names)))
             .collect();
@@ -291,7 +390,7 @@ impl App {
         // -- Containers grouped by compose project --
         let mut project_order: Vec<String> = Vec::new();
         let mut project_containers: HashMap<String, Vec<&(docker::ContainerSummary, Vec<docker::Port>)>> = HashMap::new();
-        for entry in &self.containers {
+        for entry in &sorted_containers {
             let key = entry.0.compose_project.clone().unwrap_or_else(|| "(ungrouped)".to_string());
             project_containers.entry(key.clone()).or_default().push(entry);
             if !project_order.contains(&key) {
@@ -336,11 +435,16 @@ impl App {
                         else { "⚪️" };
 
                     let status_txt = c.status.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let mut label = format!("  {badge} {:<20} {status_txt}", name);
+                    if let Some(history) = self.stats_history.get(&c.id) {
+                        let cpu_spark = self.get_sparkline(history.iter().map(|h| h.0), 100.0, 5);
+                        label.push_str(&format!("  [C:{}]", cpu_spark));
+                    }
                     items.push(UiItem {
                         kind: SidebarKind::Container,
                         id: c.id.clone(),
                         name: name.clone(),
-                        label: format!("  {badge} {:<20} {status_txt}", name),
+                        label,
                         ports: ports.to_vec(),
                         selected: self.multi_selected.contains(&c.id),
                         depth: 1,
@@ -350,7 +454,7 @@ impl App {
         }
 
         // -- Swarm services section --
-        if !self.swarm_services.is_empty() {
+        if !sorted_swarm.is_empty() {
             items.push(UiItem {
                 kind: SidebarKind::Separator,
                 id: "__swarm_sep__".to_string(),
@@ -363,7 +467,7 @@ impl App {
 
             let mut stack_order: Vec<String> = Vec::new();
             let mut stack_services: HashMap<String, Vec<&docker::SwarmService>> = HashMap::new();
-            for svc in &self.swarm_services {
+            for svc in &sorted_swarm {
                 let key = svc.stack.clone().unwrap_or_else(|| "(no stack)".to_string());
                 stack_services.entry(key.clone()).or_default().push(svc);
                 if !stack_order.contains(&key) {
@@ -397,7 +501,7 @@ impl App {
                             id: svc.id.clone(),
                             name: svc.name.clone(),
                             label,
-                            ports: vec![],
+                            ports: svc.ports.clone(),
                             selected: self.multi_selected.contains(&svc.id),
                             depth: 1,
                         });
@@ -506,7 +610,7 @@ impl App {
         let item = self.items[self.selected].clone();
 
         if let Some(mut c) = self.docker_log_child.take() {
-            let _ = c.kill().await;
+            c.kill();
         }
         self.docker_log_rx = None;
 
@@ -539,7 +643,6 @@ impl App {
                 self.docker_log_rx = Some(rx);
             }
             SidebarKind::Separator => {}
-            SidebarKind::Image => {}
         }
 
         Ok(())
@@ -555,7 +658,7 @@ impl App {
 
     pub async fn stop_shell(&mut self) {
         if let Some(mut child) = self.shell_process.take() {
-            let _ = child.kill().await;
+            let _ = child.kill();
         }
         self.shell_stdin = None;
         self.shell_active = false;
@@ -564,19 +667,25 @@ impl App {
 
     pub async fn start_shell(&mut self, id: &str, kind: SidebarKind) -> Result<()> {
         if let Some(mut c) = self.docker_log_child.take() {
-            let _ = c.kill().await;
+            c.kill();
         }
         self.docker_log_rx = None;
         self.stop_shell().await;
 
         let target_id = if kind == SidebarKind::SwarmService {
+            self.push_current_log(&format!("🔍 Looking for tasks of service: {}", id));
             match docker::find_service_task_container(&self.docker, &self.cfg.cwd, id).await {
                 Some(cid) => {
-                    self.push_current_log(&format!("🔍 Found running task container: {}", cid));
+                    self.push_current_log(&format!("✅ Found task container: {}", cid));
                     cid
                 }
                 None => {
-                    self.push_current_log("❌ No running tasks found for this service.");
+                    // Show what's actually running for debug
+                    let running = crate::docker::cmd_out(&self.docker.docker_bin, &self.cfg.cwd, &["ps", "--filter", "status=running", "--format", "{{.Names}}"]).await.unwrap_or_default();
+                    self.push_current_log("❌ No running tasks found. Running containers:");
+                    for name in running.lines().take(10) {
+                        self.push_current_log(&format!("  - {}", name));
+                    }
                     return Ok(());
                 }
             }
@@ -584,7 +693,7 @@ impl App {
             id.to_string()
         };
 
-        match docker::spawn_shell(&self.docker, &self.cfg.cwd, &target_id) {
+        match docker::spawn_shell(&self.docker, &self.cfg.cwd, &target_id).await {
             Ok((child, stdin, rx)) => {
                 self.shell_process = Some(child);
                 self.shell_stdin = Some(stdin);
@@ -606,7 +715,7 @@ impl App {
 
     pub fn start_compose_logs(&mut self, project: String) -> Result<()> {
         if let Some(mut c) = self.docker_log_child.take() {
-            let _ = tokio::spawn(async move { c.kill().await });
+            let _ = tokio::spawn(async move { c.kill() });
         }
         self.docker_log_rx = None;
         self.current_target = format!("project:{}", project);
@@ -813,7 +922,7 @@ impl App {
             return;
         }
         let item = self.items[self.selected].clone();
-        if item.kind != SidebarKind::Container {
+        if item.kind != SidebarKind::Container && item.kind != SidebarKind::SwarmService {
             return;
         }
         let port = docker::pick_best_public_port(&item.ports);
@@ -823,6 +932,27 @@ impl App {
             let _ = open::that(url);
         } else {
             self.push_current_log(&format!("No public tcp port for {}", item.name));
+        }
+    }
+
+    pub async fn export_logs(&self) -> Result<String> {
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+        let filename = format!("logs_{}_{}.txt", self.current_target.replace("/", "_"), timestamp);
+        let path = self.cfg.cwd.join(&filename);
+        let content = self.log_lines.iter().map(|s| s.to_owned()).collect::<Vec<String>>().join("\n");
+        std::fs::write(&path, content)?;
+        Ok(filename)
+    }
+
+    pub fn toggle_sort(&mut self, next: SortBy) {
+        if self.sort_by == next {
+            self.sort_order = match self.sort_order {
+                SortOrder::Asc => SortOrder::Desc,
+                SortOrder::Desc => SortOrder::Asc,
+            };
+        } else {
+            self.sort_by = next;
+            self.sort_order = SortOrder::Asc;
         }
     }
 }

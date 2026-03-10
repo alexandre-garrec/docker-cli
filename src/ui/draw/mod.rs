@@ -102,6 +102,5 @@ pub fn help_for_selected(app: &App) -> String {
             f = filtered_status, v = v_status
         ),
         SidebarKind::Separator => format!(" /:Filter{f}  C:Context  V:Volumes  N:Networks  q:Quit  ?:Help", f = filtered_status),
-        SidebarKind::Image => format!(" /:Filter{f}  q:Quit  ?:Help", f = filtered_status),
     }
 }

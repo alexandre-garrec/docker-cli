@@ -1,6 +1,6 @@
 use crate::ui::app::App;
 use crate::ui::types::SidebarKind;
-use crossterm::event::{KeyCode, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, MouseEventKind};
 
 pub async fn handle_navigation(app: &mut App, k: KeyCode) {
     if app.focus_on_list {

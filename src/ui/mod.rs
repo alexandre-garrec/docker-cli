@@ -156,7 +156,19 @@ pub async fn run(opts: RunOpts) -> Result<()> {
             }
             Some(stats) = rx_stats.recv() => {
                 app.stats_refreshing = false;
-                app.container_stats = stats;
+                app.container_stats = stats.clone();
+                if let Some(s) = stats {
+                    if !app.items.is_empty() {
+                        let item = &app.items[app.selected];
+                        if item.kind == crate::ui::types::SidebarKind::Container {
+                            let history = app.stats_history.entry(item.id.clone()).or_default();
+                            history.push_back((s.cpu_percent, s.mem_usage_mb));
+                            if history.len() > 50 {
+                                history.pop_front();
+                            }
+                        }
+                    }
+                }
                 app.rebuild_items();
             }
             ev = read_event() => {

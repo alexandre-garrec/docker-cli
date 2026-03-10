@@ -17,6 +17,9 @@ dotenvy = "0.15"
 open = "5"
 arboard = "3"
 dirs = "5"
+bollard = { version = "0.20.1", features = ["ssh"] }
+futures-util = "0.3.32"
+regex = "1.12.3"
 
 
 [target.'cfg(unix)'.dependencies]
